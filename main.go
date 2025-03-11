@@ -6,9 +6,16 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"log"
+	"math"
 	"net/http"
 	"os"
+	"os/exec"
+	"runtime/pprof"
+	"sort"
 	"strconv"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -17,6 +24,7 @@ import (
 	"golang.org/x/oauth2"
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/api/option"
+	"google.golang.org/grpc/peer"
 )
 
 var (
@@ -41,6 +49,10 @@ var (
 	bucketName = flag.String("bucket", "kislayk_europe_west4", "GCS bucket name.")
 
 	clientProtocol = flag.String("client-protocol", "http", "Network protocol.")
+
+	totalDownload = flag.Int("total-mbytes", 0, "Stop after this amount of MiB downloaded.")
+
+	cpuprofile = flag.String("cpuprofile", "", "write cpu profile to file")
 
 	// Object name = objectNamePrefix + {thread_id} + objectNameSuffix
 	objectNamePrefix = flag.String("obj-prefix", "1GB/experiment.", "Object prefix")
@@ -140,10 +152,24 @@ func ReadObject(ctx context.Context, workerID int, bucketHandle *storage.BucketH
 	}
 }
 
+type peerEvent struct {
+	time  time.Time
+	event string
+	peer  *peer.Peer
+}
+
 func main() {
 	flag.Parse()
+	fmt.Printf("Starting benchmark with params:\n")
+	fmt.Printf("workers: %d, grpcConnPoolSize: %d\n", *numOfWorkers, *grpcConnPoolSize)
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	go func() {
+		printConns(ctx)
+	}()
+
 	fmt.Printf("Workload start time: %s\n", time.Now().String())
-	ctx := context.Background()
 
 	var client *storage.Client
 	var err error
@@ -178,12 +204,26 @@ func main() {
 
 	rampUp(warmupCtx, cancelFn, bucketHandle)
 
+	// runtime.SetMutexProfileFraction(1)
+
+	if *cpuprofile != "" {
+		f, err := os.Create(*cpuprofile)
+		if err != nil {
+			log.Fatal(err)
+		}
+		pprof.StartCPUProfile(f)
+	}
+
 	//fmt.Println("Ramp-up complete. Starting run on actual traffic.")
 	startTime := time.Now()
 	var eG errgroup.Group
 
 	actualRunCtx, cancelFn := context.WithDeadline(ctx, startTime.Add(*runTime))
 	defer cancelFn()
+
+	var errCount atomic.Int64
+	events := []peerEvent{}
+	mu := sync.Mutex{}
 
 	// Run the actual workload
 	for i := 0; i < *numOfWorkers; i++ {
@@ -195,8 +235,30 @@ func main() {
 				case <-actualRunCtx.Done():
 					return nil
 				default:
-					bytesRead, _ := ReadObject(actualRunCtx, idx, bucketHandle)
+					peerStrt := time.Now()
+					p := &peer.Peer{}
+					bytesRead, err := ReadObject(peer.NewContext(actualRunCtx, p), idx, bucketHandle)
+					if err != nil {
+						errCount.Add(1)
+					}
+					if *clientProtocol == "grpc" && bytesRead > 0 {
+						mu.Lock()
+						events = append(events, peerEvent{
+							time:  peerStrt,
+							event: "start",
+							peer:  p,
+						}, peerEvent{
+							time:  time.Now(),
+							event: "end",
+							peer:  p,
+						})
+						mu.Unlock()
+					}
+
 					totalBytesRead.Add(bytesRead)
+					if *totalDownload > 0 && totalBytesRead.Load() > int64(*totalDownload)*MiB {
+						return nil
+					}
 				}
 			}
 		})
@@ -204,14 +266,154 @@ func main() {
 
 	err = eG.Wait()
 	totalDuration := time.Since(startTime)
+	if *cpuprofile != "" {
+		pprof.StopCPUProfile()
+	}
+
+	// Sort events by time.
+	sort.Slice(events, func(i, j int) bool {
+		return events[i].time.Before(events[j].time)
+	})
+
+	uniq_backends := make(map[string]struct{})
+	backend_load := make(map[string]int)
+	conn_load := make(map[string]int)
+
+	// Analyze events
+	accRPB := float64(0)
+	accNIB := float64(0)
+	accNIC := float64(0)
+
+	favgRPB := float64(0)
+	favgNIB := float64(0)
+	favgNIC := float64(0)
+
+	if *clientProtocol == "grpc" {
+		prevMicro := microOffset(events[0].time)
+		for _, event := range events {
+			conn_key := event.peer.LocalAddr.String() + "-" + event.peer.Addr.String()
+			if event.event == "start" {
+				uniq_backends[event.peer.Addr.String()] = struct{}{}
+				if _, ok := backend_load[event.peer.Addr.String()]; !ok {
+					backend_load[event.peer.Addr.String()] = 1
+				} else {
+					backend_load[event.peer.Addr.String()]++
+				}
+				if _, ok := conn_load[conn_key]; !ok {
+					conn_load[conn_key] = 1
+				} else {
+					conn_load[conn_key]++
+				}
+			}
+			if event.event == "end" {
+				backend_load[event.peer.Addr.String()]--
+				conn_load[conn_key]--
+			}
+			micro := microOffset(event.time)
+			bas := make([]string, 0, len(backend_load))
+			for ba := range backend_load {
+				bas = append(bas, ba)
+			}
+			sort.Strings(bas)
+			non_idle_bes := 0
+			non_idle_conns := 0
+			max_rpb := 0
+
+			for _, ba := range bas {
+				if backend_load[ba] > 0 {
+					non_idle_bes++
+				}
+				if max_rpb < backend_load[ba] {
+					max_rpb = backend_load[ba]
+				}
+			}
+
+			for _, v := range conn_load {
+				if v > 0 {
+					non_idle_conns++
+				}
+			}
+
+			dur := micro - prevMicro
+			accRPB += float64(dur) * float64(max_rpb)
+			accNIB += float64(dur) * float64(non_idle_bes)
+			accNIC += float64(dur) * float64(non_idle_conns)
+			prevMicro = micro
+		}
+
+		favgRPB = float64(accRPB) / float64(prevMicro-microOffset(events[0].time))
+		favgNIB = float64(accNIB) / float64(prevMicro-microOffset(events[0].time))
+		favgNIC = float64(accNIC) / float64(prevMicro-microOffset(events[0].time))
+	}
+
+	cancel()
+
+	// fmt.Println("MUTEX INFO START")
+	// pprof.Lookup("mutex").WriteTo(os.Stdout, 0)
+	// fmt.Println("MUTEX INFO END")
 
 	if err == nil && err != context.DeadlineExceeded {
-		fmt.Printf("Protocol: %s, Bandwidth: %d MiB/s\n", protocol, totalBytesRead.Load()/(int64(totalDuration.Seconds())*MiB))
+		bndwth := float64(1_000_000) / float64(MiB) * float64(totalBytesRead.Load()) / float64(totalDuration.Microseconds())
+
+		if *clientProtocol == "grpc" {
+			fmt.Printf("Unique backends: %d\n", len(uniq_backends))
+			fmt.Printf("Average maxRPB/s: %.3f\n", favgRPB)
+			fmt.Printf("Average NIB/s: %.3f (%.2f MiB/s per backend)\n", favgNIB, bndwth/favgNIB)
+			fmt.Printf("Average NIC/s: %.3f (%.2f MiB/s per connection)\n", favgNIC, bndwth/favgNIC)
+		}
+
+		fmt.Printf("Protocol: %s, Bandwidth: %.0f MiB/s, errors: %d\n", protocol, bndwth, errCount.Load())
 		fmt.Printf("Workload end time: %s\n\n", time.Now().String())
+		if *cpuprofile != "" {
+			fmt.Println("Waiting to exit...")
+			time.Sleep(5 * time.Minute)
+		}
 		os.Exit(0)
 	} else {
 		fmt.Fprintf(os.Stderr, "Error while running benchmark: %v", err)
 		fmt.Printf("Workload end time: %s\n\n", time.Now().String())
 		os.Exit(1)
 	}
+}
+
+func printConns(ctx context.Context) {
+	cmd := exec.Command("netstat", "-pn")
+
+	output, err := cmd.Output()
+	if err != nil {
+		fmt.Println("Error:", err)
+		return
+	}
+
+	dp_conns := 0
+	https_conns := 0
+
+	lines := strings.Split(string(output), "\n")
+	for _, line := range lines {
+		if strings.Contains(line, "ESTABLISHED") {
+			if strings.Contains(line, "34.126.") {
+				dp_conns++
+			} else if strings.Contains(line, ":443 ") {
+				https_conns++
+			}
+		}
+	}
+
+	fmt.Printf("Directpath connections: %d\n", dp_conns)
+	fmt.Printf("HTTPS connections: %d\n", https_conns)
+	time.Sleep(time.Second * 10)
+	if ctx.Err() == nil {
+		printConns(ctx)
+	}
+}
+
+func microOffset(t time.Time) int64 {
+	if _, strtime, ok := strings.Cut(t.String(), " m=+"); ok {
+		seconds, err := strconv.ParseFloat(strtime, 64)
+		if err != nil {
+			return int64(0)
+		}
+		return int64(math.Round(seconds * 1e6))
+	}
+	return int64(0)
 }
