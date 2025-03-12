@@ -59,3 +59,5 @@ require (
 	google.golang.org/grpc v1.69.4 // indirect
 	google.golang.org/protobuf v1.36.3 // indirect
 )
+
+replace google.golang.org/grpc => ../grpc-go
