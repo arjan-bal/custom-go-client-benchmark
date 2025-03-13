@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"runtime"
 	"runtime/pprof"
 	"strconv"
 	"strings"
@@ -50,6 +51,8 @@ var (
 	totalDownload = flag.Int("total-mbytes", 0, "Stop after this amount of MiB downloaded.")
 
 	cpuprofile = flag.String("cpuprofile", "", "write cpu profile to file")
+
+	memprofile = flag.String("memprofile", "", "write memory profile to `file`")
 
 	// Object name = objectNamePrefix + {thread_id} + objectNameSuffix
 	objectNamePrefix = flag.String("obj-prefix", "1GB/experiment.", "Object prefix")
@@ -246,6 +249,20 @@ func main() {
 	}
 
 	cancel()
+	if *memprofile != "" {
+		f, err := os.Create(*memprofile)
+		if err != nil {
+			log.Fatal("could not create memory profile: ", err)
+		}
+		defer f.Close() // error handling omitted for example
+		runtime.GC()    // get up-to-date statistics
+		// Lookup("allocs") creates a profile similar to go test -memprofile.
+		// Alternatively, use Lookup("heap") for a profile
+		// that has inuse_space as the default index.
+		if err := pprof.Lookup("allocs").WriteTo(f, 0); err != nil {
+			log.Fatal("could not write memory profile: ", err)
+		}
+	}
 
 	// fmt.Println("MUTEX INFO START")
 	// pprof.Lookup("mutex").WriteTo(os.Stdout, 0)
