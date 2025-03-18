@@ -10,11 +10,9 @@ import (
 	"log"
 	"net/http"
 	"os"
-	"os/exec"
 	"runtime"
 	"runtime/pprof"
 	"strconv"
-	"strings"
 	"sync/atomic"
 	"time"
 
@@ -159,10 +157,6 @@ func main() {
 
 	ctx, cancel := context.WithCancel(context.Background())
 
-	go func() {
-		printConns(ctx)
-	}()
-
 	fmt.Printf("Workload start time: %s\n", time.Now().String())
 
 	var client *storage.Client
@@ -282,35 +276,4 @@ func main() {
 	fmt.Fprintf(os.Stderr, "Error while running benchmark: %v", err)
 	fmt.Printf("Workload end time: %s\n\n", time.Now().String())
 	os.Exit(1)
-}
-
-func printConns(ctx context.Context) {
-	cmd := exec.Command("netstat", "-pn")
-
-	output, err := cmd.Output()
-	if err != nil {
-		fmt.Println("Error:", err)
-		return
-	}
-
-	dpConns := 0
-	httpsConns := 0
-
-	lines := strings.Split(string(output), "\n")
-	for _, line := range lines {
-		if strings.Contains(line, "ESTABLISHED") {
-			if strings.Contains(line, "34.126.") {
-				dpConns++
-			} else if strings.Contains(line, ":443 ") {
-				httpsConns++
-			}
-		}
-	}
-
-	fmt.Printf("Directpath connections: %d\n", dpConns)
-	fmt.Printf("HTTPS connections: %d\n", httpsConns)
-	time.Sleep(time.Second * 10)
-	if ctx.Err() == nil {
-		printConns(ctx)
-	}
 }
