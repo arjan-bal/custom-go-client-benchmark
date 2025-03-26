@@ -13,6 +13,7 @@ import (
 	"runtime"
 	"runtime/pprof"
 	"strconv"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -21,6 +22,8 @@ import (
 	"golang.org/x/oauth2"
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/api/option"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/peer"
 )
 
 var (
@@ -117,12 +120,12 @@ func rampUp(warmupCtx context.Context, cancelFn context.CancelFunc, bucketHandle
 }
 
 // CreateGrpcClient creates grpc client.
-func CreateGrpcClient(ctx context.Context) (client *storage.Client, err error) {
+func CreateGrpcClient(ctx context.Context, p *peer.Peer) (client *storage.Client, err error) {
 	tokenSource, err := GetTokenSource(ctx, "")
 	if err != nil {
 		return nil, err
 	}
-	return storage.NewGRPCClient(ctx, option.WithGRPCConnectionPool(*grpcConnPoolSize), option.WithTokenSource(tokenSource), storage.WithDisabledClientMetrics())
+	return storage.NewGRPCClient(ctx, option.WithGRPCConnectionPool(*grpcConnPoolSize), option.WithTokenSource(tokenSource), storage.WithDisabledClientMetrics(), option.WithGRPCDialOption(grpc.WithDefaultCallOptions(grpc.Peer(p))))
 }
 
 // ReadObject creates reader object corresponding to workerID with the help of bucketHandle.
@@ -161,13 +164,14 @@ func main() {
 
 	var client *storage.Client
 	var err error
+	p := &peer.Peer{}
 	protocol := ""
 	if *clientProtocol == "http" {
 		protocol = "http"
 		client, err = CreateHTTPClient(ctx)
 	} else {
 		protocol = "grpc"
-		client, err = CreateGrpcClient(ctx)
+		client, err = CreateGrpcClient(ctx, p)
 	}
 
 	if err != nil {
@@ -210,6 +214,8 @@ func main() {
 	defer cancelFn()
 
 	var errCount atomic.Int64
+	mu := sync.Mutex{}
+	backneds := map[string]bool{}
 
 	// Run the actual workload
 	for i := range *numOfWorkers {
@@ -221,12 +227,18 @@ func main() {
 				case <-actualRunCtx.Done():
 					return nil
 				default:
-					bytesRead, err := ReadObject(actualRunCtx, idx, bucketHandle)
+					bytesRead, err := ReadObject(ctx, idx, bucketHandle)
 					if err != nil {
 						errCount.Add(1)
 						fmt.Println("Debug: ", err)
 						continue
 					}
+					mu.Lock()
+					addr := p.Addr
+					if addr != nil {
+						backneds[addr.String()] = true
+					}
+					mu.Unlock()
 					totalBytesRead.Add(bytesRead)
 					if *totalDownload > 0 && totalBytesRead.Load() > int64(*totalDownload)*MiB {
 						return nil
@@ -241,6 +253,9 @@ func main() {
 	if *cpuprofile != "" {
 		pprof.StopCPUProfile()
 	}
+
+	fmt.Println("Number of unique backends used: ", len(backneds))
+	fmt.Printf("%v\n", backneds)
 
 	cancel()
 	if *memprofile != "" {
