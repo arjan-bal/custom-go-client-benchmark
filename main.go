@@ -255,7 +255,6 @@ func main() {
 	}
 
 	fmt.Println("Number of unique backends used: ", len(backneds))
-	fmt.Printf("%v\n", backneds)
 
 	cancel()
 	if *memprofile != "" {
