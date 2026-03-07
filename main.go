@@ -157,6 +157,8 @@ func main() {
 	flag.Parse()
 	fmt.Printf("Starting benchmark with params:\n")
 	fmt.Printf("workers: %d, grpcConnPoolSize: %d\n", *numOfWorkers, *grpcConnPoolSize)
+	cleanup := startMemoryMonitor()
+	defer cleanup()
 
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -272,10 +274,6 @@ func main() {
 		}
 	}
 
-	// fmt.Println("MUTEX INFO START")
-	// pprof.Lookup("mutex").WriteTo(os.Stdout, 0)
-	// fmt.Println("MUTEX INFO END")
-
 	if err == nil && err != context.DeadlineExceeded {
 		bndwth := float64(1_000_000) / float64(MiB) * float64(totalBytesRead.Load()) / float64(totalDuration.Microseconds())
 
@@ -290,4 +288,37 @@ func main() {
 	fmt.Fprintf(os.Stderr, "Error while running benchmark: %v", err)
 	fmt.Printf("Workload end time: %s\n\n", time.Now().String())
 	os.Exit(1)
+}
+
+// startMemoryMonitor prints memory usage every 10 seconds.
+// It returns a cleanup function so you can stop it when your benchmark ends.
+func startMemoryMonitor() func() {
+	ticker := time.NewTicker(10 * time.Second)
+	done := make(chan struct{})
+
+	go func() {
+		var m runtime.MemStats
+		for {
+			select {
+			case <-ticker.C:
+				runtime.ReadMemStats(&m)
+
+				// Convert to Megabytes for easier reading
+				allocMB := m.Alloc / 1024 / 1024
+				heapInuseMB := m.HeapInuse / 1024 / 1024
+
+				fmt.Printf("[%s] In-Use (Alloc): %v MB | OS Heap (HeapInuse): %v MB\n",
+					time.Now().Format("15:04:05"), allocMB, heapInuseMB)
+
+			case <-done:
+				ticker.Stop()
+				return
+			}
+		}
+	}()
+
+	// Return the stop function
+	return func() {
+		close(done)
+	}
 }
