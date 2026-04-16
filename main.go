@@ -153,6 +153,19 @@ func ReadObject(ctx context.Context, workerID int, bucketHandle *storage.BucketH
 	}
 }
 
+func writeHeapProfile(filename string) {
+	f, err := os.Create(filename)
+	if err != nil {
+		log.Printf("could not create memory profile %q: %v", filename, err)
+		return
+	}
+	defer f.Close()
+	runtime.GC() // get up-to-date statistics
+	if err := pprof.Lookup("allocs").WriteTo(f, 0); err != nil {
+		log.Printf("could not write memory profile %q: %v", filename, err)
+	}
+}
+
 func main() {
 	flag.Parse()
 	fmt.Printf("Starting benchmark with params:\n")
@@ -161,6 +174,22 @@ func main() {
 	defer cleanup()
 
 	ctx, cancel := context.WithCancel(context.Background())
+
+	if *memprofile != "" {
+		go func() {
+			ticker := time.NewTicker(2 * time.Minute)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ticker.C:
+					filename := fmt.Sprintf("%s_%s", *memprofile, time.Now().Format("2006-01-02T15_04_05"))
+					writeHeapProfile(filename)
+				case <-ctx.Done():
+					return
+				}
+			}
+		}()
+	}
 
 	fmt.Printf("Workload start time: %s\n", time.Now().String())
 
@@ -260,18 +289,7 @@ func main() {
 
 	cancel()
 	if *memprofile != "" {
-		f, err := os.Create(*memprofile)
-		if err != nil {
-			log.Fatal("could not create memory profile: ", err)
-		}
-		defer f.Close() // error handling omitted for example
-		runtime.GC()    // get up-to-date statistics
-		// Lookup("allocs") creates a profile similar to go test -memprofile.
-		// Alternatively, use Lookup("heap") for a profile
-		// that has inuse_space as the default index.
-		if err := pprof.Lookup("allocs").WriteTo(f, 0); err != nil {
-			log.Fatal("could not write memory profile: ", err)
-		}
+		writeHeapProfile(*memprofile)
 	}
 
 	if err == nil && err != context.DeadlineExceeded {
