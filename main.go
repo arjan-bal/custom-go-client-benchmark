@@ -125,7 +125,16 @@ func CreateGrpcClient(ctx context.Context, p *peer.Peer) (client *storage.Client
 	if err != nil {
 		return nil, err
 	}
-	return storage.NewGRPCClient(ctx, option.WithGRPCConnectionPool(*grpcConnPoolSize), option.WithTokenSource(tokenSource), storage.WithDisabledClientMetrics(), option.WithGRPCDialOption(grpc.WithDefaultCallOptions(grpc.Peer(p))))
+	opts := []option.ClientOption{
+		option.WithGRPCConnectionPool(*grpcConnPoolSize),
+		option.WithTokenSource(tokenSource),
+		storage.WithDisabledClientMetrics(),
+		option.WithGRPCDialOption(grpc.WithDefaultCallOptions(grpc.Peer(p))),
+		option.WithGRPCDialOption(grpc.WithInitialWindowSize(1024 * 1024)),
+		option.WithGRPCDialOption(grpc.WithInitialConnWindowSize(1024 * 1024)),
+	}
+
+	return storage.NewGRPCClient(ctx, opts...)
 }
 
 // ReadObject creates reader object corresponding to workerID with the help of bucketHandle.
