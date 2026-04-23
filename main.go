@@ -107,7 +107,7 @@ func rampUp(warmupCtx context.Context, cancelFn context.CancelFunc, bucketHandle
 			}
 			time.Sleep(1 * time.Second)
 			eG.Go(func() error {
-				_, err := ReadObject(warmupCtx, idx, bucketHandle)
+				_, err := ReadObject(warmupCtx, idx, bucketHandle, io.Discard)
 				if err != nil {
 					err = fmt.Errorf("while reading object %v: %w", *objectNamePrefix+strconv.Itoa(idx)+*objectNameSuffix, err)
 					return err
@@ -138,7 +138,7 @@ func CreateGrpcClient(ctx context.Context, p *peer.Peer) (client *storage.Client
 }
 
 // ReadObject creates reader object corresponding to workerID with the help of bucketHandle.
-func ReadObject(ctx context.Context, workerID int, bucketHandle *storage.BucketHandle) (bytesRead int64, err error) {
+func ReadObject(ctx context.Context, workerID int, bucketHandle *storage.BucketHandle, w io.Writer) (bytesRead int64, err error) {
 	objectName := *objectNamePrefix + strconv.Itoa(workerID) + *objectNameSuffix
 
 	select {
@@ -153,7 +153,7 @@ func ReadObject(ctx context.Context, workerID int, bucketHandle *storage.BucketH
 		defer rc.Close()
 
 		// Calls Reader.WriteTo implicitly.
-		count, err := io.Copy(io.Discard, rc)
+		count, err := io.Copy(w, rc)
 		bytesRead += count
 		if err != nil {
 			return bytesRead, fmt.Errorf("while reading and discarding content: %v", err)
@@ -261,17 +261,35 @@ func main() {
 	for i := range *numOfWorkers {
 		idx := i
 		eG.Go(func() error {
+			// Provide a specific directory like "." (current directory) instead of "" (default temp).
+			tmpFile, err := os.Create("worker.tmp")
+			if err != nil {
+				panic(err)
+			}
+
+			defer func() {
+				tmpFile.Close()
+				os.Remove(tmpFile.Name())
+			}()
+
 			//fmt.Printf("Worker %d started\n", idx)
 			for {
 				select {
 				case <-actualRunCtx.Done():
 					return nil
 				default:
-					bytesRead, err := ReadObject(ctx, idx, bucketHandle)
+					bytesRead, err := ReadObject(ctx, idx, bucketHandle, tmpFile)
 					if err != nil {
 						errCount.Add(1)
 						fmt.Println("Debug: ", err)
 						continue
+					}
+					if err := tmpFile.Sync(); err != nil {
+						panic(err)
+					}
+
+					if _, err := tmpFile.Seek(0, io.SeekStart); err != nil {
+						panic(err)
 					}
 					mu.Lock()
 					addr := p.Addr
